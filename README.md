@@ -21,7 +21,13 @@
 8. [Verification](#8-verification)
 9. [Ecosystem & Tools](#9-ecosystem--tools)
 10. [Common Misconceptions](#10-common-misconceptions)
-11. [References](#11-references)
+11. [AI and SLSA](#11-ai-and-slsa)
+    - [Why AI Introduces New Supply Chain Risks](#why-ai-introduces-new-supply-chain-risks)
+    - [AI Artifacts vs. Traditional Software Artifacts](#ai-artifacts-vs-traditional-software-artifacts)
+    - [SLSA Applied to AI: Level by Level](#slsa-applied-to-ai-level-by-level)
+    - [Emerging Standards and Tooling](#emerging-standards-and-tooling)
+    - [AI as a Builder: Risks of AI-Generated Code](#ai-as-a-builder-risks-of-ai-generated-code)
+12. [References](#12-references)
 
 ---
 
@@ -644,7 +650,342 @@ Provenance should be verified at **consumption time** — when your CI pipeline 
 
 ---
 
-## 11. References
+## 11. AI and SLSA
+
+Artificial intelligence introduces a new class of artifact into the software supply chain — one that is larger, more opaque, more expensive to produce, and harder to reproduce than any traditional software binary. The SLSA framework was designed for deterministic builds of source code; applying it to AI requires both adaptation of existing concepts and introduction of entirely new provenance dimensions.
+
+This section examines AI's impact on SLSA from two directions: AI artifacts (models and datasets) as objects that need supply chain protection, and AI as a builder (code generation tools, autonomous agents) that introduces new risk into the build process itself.
+
+---
+
+### Why AI Introduces New Supply Chain Risks
+
+Traditional software supply chain attacks target the build pipeline — the transformation of source code into a binary. The source code is human-authored, version-controlled, and relatively compact. An attacker who wants to tamper with the artifact must either modify the source, compromise the build, or tamper with the distributed artifact.
+
+AI models introduce compounding risk at every layer:
+
+| Layer | Traditional Software | AI Model |
+|-------|---------------------|----------|
+| **Source** | Source code in a VCS (Git) | Training code + training data (often terabytes, distributed, dynamic) |
+| **Build** | Compiler + linker (deterministic, minutes) | Training run (GPU cluster, days to weeks, non-deterministic) |
+| **Artifact** | Binary / package (MBs) | Model weights (GBs to hundreds of GBs) |
+| **Dependencies** | npm/pip packages, pinned | Pretrained base models, datasets, fine-tuning adapters |
+| **Reproducibility** | Bit-for-bit reproducible (ideally) | Rarely reproducible without identical hardware, seeds, and data order |
+| **Tampering surface** | Build steps, registry | Weights files, quantization step, adapter merging, GGUF conversion |
+
+A further dimension is introduced by the **non-deterministic nature of training**: even if two training runs use identical code, data, and hyperparameters, floating-point non-determinism across GPU kernels means the resulting weight tensors will differ. This fundamentally challenges the hermetic-build and reproducibility assumptions that underpin SLSA Level 3.
+
+Additionally, AI supply chains surface a new category of attack not addressed by classic SLSA: **data poisoning** — the deliberate injection of malicious or biased examples into a training dataset to influence the model's learned behaviour at inference time, without any tampering of the artifact after training completes.
+
+---
+
+### AI Artifacts vs. Traditional Software Artifacts
+
+Before mapping SLSA levels to AI, it is important to characterise what an AI artifact actually is and why provenance for it is structurally different.
+
+**An AI artifact typically consists of:**
+
+- **Model weights** — the primary artifact; large binary files (`.safetensors`, `.gguf`, `.pt`, `.bin`) encoding learned parameters
+- **Configuration files** — architecture definition (`config.json`), tokenizer configuration, generation defaults
+- **Tokenizer** — vocabulary and tokenization rules; altering this changes model behaviour without touching weights
+- **Adapter layers** — LoRA, QLoRA, or other parameter-efficient fine-tuning (PEFT) adapters that modify a base model
+- **Quantized variants** — post-training quantized versions (INT4, INT8) produced by a separate, auditable conversion step
+
+Each of these components can be independently tampered with. A compromised tokenizer that maps certain tokens to unexpected IDs, or a malicious LoRA adapter merged with a legitimate base model, can produce harmful outputs without the base model weights ever being touched.
+
+**Provenance for AI must therefore capture additional metadata not required for traditional software:**
+
+| Provenance Field | Traditional Software | AI Model |
+|-----------------|---------------------|----------|
+| Source repository + commit | ✓ Required | ✓ Required (training code) |
+| Build environment | ✓ Required | ✓ Required (framework versions, CUDA, hardware) |
+| Artifact digest | ✓ Required | ✓ Required (per-file for all components) |
+| Input dataset identity | — Not applicable | ✓ Critical (dataset name, version, digest) |
+| Base model identity | — Not applicable | ✓ Critical for fine-tuned models |
+| Hyperparameters | — Not applicable | Recommended (learning rate, epochs, batch size) |
+| Hardware attestation | — Not applicable | Recommended (GPU type affects numerical outputs) |
+| Evaluation results | — Not applicable | Recommended (benchmark scores, safety eval results) |
+| Model card | — Not applicable | Strongly recommended |
+
+---
+
+### SLSA Applied to AI: Level by Level
+
+#### AI at Level 0 — No Guarantees
+
+**Current state of most publicly distributed AI models.**
+
+A model uploaded directly to Hugging Face from a researcher's workstation, with no CI/CD pipeline, no provenance attestation, and no cryptographic binding between the weights and any training run, is SLSA Level 0. The consumer must trust the uploader unconditionally.
+
+**Real-world risk:** A malicious actor registers a similar-looking Hugging Face organization name (`mistral-community` vs. `mistralai`) and uploads weights that have been backdoored during a manual merge step. No provenance exists to distinguish the legitimate model from the tampered one. This mirrors the typosquatting attacks seen in npm and PyPI, but the payload is a multi-gigabyte weights file rather than a package tarball.
+
+```
+# What SLSA L0 looks like for an AI model publish
+python train.py --config config.yaml   # Runs on a researcher's A100
+# ... days later ...
+huggingface-cli upload my-org/my-model ./checkpoints/final/
+# No attestation, no digest record, no build log
+```
+
+#### AI at Level 1 — Provenance Exists
+
+**Goal:** Establish a machine-readable record of the training run and publish it alongside the model weights.
+
+At Level 1, the training process is scripted and automated (no manual interventions that produce the final artifact), and a provenance document is emitted recording the training run metadata. The provenance need not be signed; its primary value is auditability and tamper-detection after the fact.
+
+**Minimum provenance fields for an AI artifact at L1:**
+
+```json
+{
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "subject": [
+    {
+      "name": "model.safetensors",
+      "digest": { "sha256": "a1b2c3..." }
+    },
+    {
+      "name": "tokenizer.json",
+      "digest": { "sha256": "d4e5f6..." }
+    }
+  ],
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://example.com/ai-training/v1",
+      "externalParameters": {
+        "trainingScript": "train.py",
+        "configFile": "config.yaml",
+        "configDigest": "sha256:7890ab...",
+        "baseModel": "meta-llama/Meta-Llama-3-8B",
+        "baseModelDigest": "sha256:cdef01...",
+        "dataset": "HuggingFaceH4/ultrachat_200k",
+        "datasetRevision": "dc715f4"
+      }
+    },
+    "runDetails": {
+      "builder": { "id": "https://github.com/my-org/my-model/actions/runs/9876543210" },
+      "metadata": {
+        "invocationId": "run-2024-06-01-001",
+        "startedOn": "2024-06-01T02:00:00Z",
+        "finishedOn": "2024-06-03T14:37:00Z"
+      }
+    }
+  }
+}
+```
+
+**What Level 1 provides for AI:** A consumer can verify that the downloaded `model.safetensors` matches the digest in the provenance. If the file has been tampered with after training, the hash will not match. The consumer can also inspect which dataset and base model were declared as inputs — though they cannot yet verify that these declarations are truthful.
+
+**Example — automated training pipeline with provenance emission:**
+
+```yaml
+# .github/workflows/train.yml
+jobs:
+  train:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run training
+        run: python train.py --config config.yaml --output-dir ./output
+
+      - name: Compute artifact digests and emit provenance
+        run: |
+          python scripts/emit_provenance.py \
+            --artifacts ./output/model.safetensors ./output/tokenizer.json \
+            --base-model "meta-llama/Meta-Llama-3-8B" \
+            --dataset "HuggingFaceH4/ultrachat_200k" \
+            --run-id "$GITHUB_RUN_ID" \
+            --output provenance.json
+
+      - name: Upload model and provenance to Hugging Face
+        run: |
+          huggingface-cli upload my-org/my-model ./output/
+          huggingface-cli upload my-org/my-model provenance.json
+```
+
+#### AI at Level 2 — Hosted Build Service
+
+**Goal:** Make the training provenance tamper-evident and independently verifiable. The provenance is generated and signed by the training infrastructure, not by the researcher's workflow code.
+
+This is architecturally more complex for AI than for traditional software, for two reasons:
+
+1. **Training infrastructure is often self-hosted** — GPU clusters are rarely provided by a third-party build service in the same way GitHub Actions provides compute for software builds. This means the "trusted builder" must be the organization's own training platform, which must be hardened and attested independently.
+
+2. **Training is long-running and stateful** — unlike a 5-minute software build, a training run may take days. The provenance service must remain available and consistent across the entire training duration.
+
+**What changes at L2 for AI:**
+
+- The training orchestration system (Kubeflow Pipelines, Metaflow, MLflow, or a custom training platform) — not the training script itself — generates and signs the provenance
+- The signing key is inaccessible to the training job
+- Provenance is uploaded to a transparency log (Rekor) upon training completion
+- The base model's own provenance is resolved and linked as a dependency
+
+**Example — container image for model serving with L2 provenance:**
+
+The model inference container is a traditional software artifact and can achieve L2 straightforwardly using standard Cosign tooling:
+
+```yaml
+# The serving container is a normal container build — full L2 achievable
+- name: Build and sign serving container
+  run: |
+    docker build \
+      --build-arg MODEL_DIGEST=sha256:a1b2c3... \
+      -t ghcr.io/my-org/my-model-server:v1.0.0 .
+    docker push ghcr.io/my-org/my-model-server:v1.0.0
+    cosign sign --yes \
+      --annotations="model.digest=sha256:a1b2c3..." \
+      --annotations="model.name=my-org/my-model" \
+      ghcr.io/my-org/my-model-server:v1.0.0
+```
+
+By embedding the model weights digest as a Cosign annotation on the serving container, a consumer can verify both the container's provenance (L2) and that it was built with a specific, known model artifact.
+
+**Signing raw model weights at L2:**
+
+The OpenSSF Model Signing (OMS) specification — released in 2025 — extends the Sigstore bundle format to cover multi-file AI artifacts:
+
+```bash
+# Sign a Hugging Face model directory (all files in a single OMS signature)
+pip install model-signing
+
+# Sign using keyless OIDC (from a CI environment with an OIDC token)
+python -m model_signing.sign \
+  --model_path ./my-model/ \
+  --sig_out ./my-model.sig.json \
+  --signing_key sigstore
+
+# Verify
+python -m model_signing.verify \
+  --model_path ./my-model/ \
+  --sig_path ./my-model.sig.json \
+  --certificate_identity "https://github.com/my-org/my-model/.github/workflows/train.yml@refs/heads/main" \
+  --certificate_oidc_issuer "https://token.actions.githubusercontent.com"
+```
+
+#### AI at Level 3 — Hardened Builds
+
+**Goal:** Make training provenance non-falsifiable, the training environment hermetic, and the artifact verifiably linked to an auditable, tamper-resistant training run.
+
+Level 3 is the most challenging level for AI workloads and represents the current frontier of research and engineering effort in the field. The core difficulty is that **hermetic, reproducible builds** — the cornerstone of SLSA L3 for software — are not directly achievable for neural network training with current hardware.
+
+**The reproducibility gap:** Floating-point arithmetic on GPUs is not fully associative. The order in which partial sums are accumulated across GPU threads varies with parallelism strategy, producing different rounding errors across runs. Even with fixed random seeds, identical data order, and identical hyperparameters, two training runs on the same hardware type will often produce weights that differ in the last few bits. Across different hardware generations or vendors, divergence can be more significant.
+
+**What L3 means in practice for AI — current best achievable posture:**
+
+| L3 Software Requirement | AI Equivalent |
+|------------------------|---------------|
+| Hermetic build (no network mid-build) | Training data fully pre-fetched and hash-verified before training begins; no dynamic data downloads during training |
+| Ephemeral environment | Training job runs in a freshly provisioned container/VM with no persistent state from prior runs |
+| Isolated build | Training job cannot communicate with or influence concurrent training jobs |
+| Non-falsifiable provenance | Training orchestrator generates and signs provenance in a privileged sidecar inaccessible to the training process; signed with a hardware-rooted key (TPM or HSM) |
+| Reproducible artifact | Not achievable for neural network training — mitigated by hardware attestation and comprehensive environment capture |
+
+**Hardware attestation as the L3 substitute for reproducibility:**
+
+Because exact reproducibility is not achievable, L3-equivalent assurance for AI relies on **hardware attestation** — a cryptographic proof from the compute hardware itself (GPU or TEE) that a specific computation was executed on attested hardware in an unmodified environment. NVIDIA's Hopper architecture (H100) supports Confidential Computing mode, enabling GPU attestation via the NVIDIA Attestation Service. An L3-posture training run would:
+
+1. Boot the training VM in a Trusted Execution Environment (TEE) or with attestable GPU compute
+2. Obtain a hardware attestation report from the GPU before training begins
+3. Run training with all data pre-staged and network disabled
+4. Have a privileged orchestration sidecar sign the provenance — including the hardware attestation report — using an HSM-backed key
+5. Upload the signed provenance + hardware attestation to Rekor
+
+```json
+{
+  "predicate": {
+    "buildDefinition": {
+      "systemParameters": {
+        "hardwareAttestation": {
+          "type": "nvidia-hopper-cc",
+          "report": "base64-encoded-attestation-report...",
+          "attestationServiceVerificationURI": "https://nras.nvidia.com/v1/attestation/gpu"
+        },
+        "computeEnvironment": {
+          "containerDigest": "sha256:abc...",
+          "cudaVersion": "12.4",
+          "driverVersion": "550.54.15",
+          "gpuCount": 8,
+          "gpuModel": "NVIDIA H100 SXM5 80GB"
+        }
+      }
+    }
+  }
+}
+```
+
+This does not prove the weights are numerically identical to a reference run, but it does prove that the weights were produced by a specific, attested computation on unmodified hardware — which is the strongest integrity claim currently achievable for neural network training.
+
+---
+
+### Emerging Standards and Tooling
+
+The ecosystem for AI supply chain security is maturing rapidly. The following initiatives are directly relevant to applying SLSA concepts to AI artifacts:
+
+| Standard / Tool | Description | SLSA Relevance |
+|----------------|-------------|----------------|
+| [OpenSSF Model Signing (OMS)](https://openssf.org/blog/2025/06/25/an-introduction-to-the-openssf-model-signing-oms-specification/) | Sigstore-compatible signing format for multi-file AI model artifacts; supports keyless OIDC signing | L2 signing for model weights |
+| [sigstore/model-transparency](https://github.com/sigstore/model-transparency) | Reference implementation of model signing; integrates with Hugging Face and OCI registries | L1/L2 provenance emission and verification |
+| [Hugging Face model cards](https://huggingface.co/docs/hub/model-cards) | Structured metadata format for datasets, training details, evaluation results; not cryptographically signed but foundational for L1 provenance | L1 metadata |
+| [NVIDIA Hopper Confidential Computing](https://www.nvidia.com/en-us/data-center/solutions/confidential-computing/) | Hardware attestation for GPU training workloads; enables cryptographic proof of execution environment | L3 hardware attestation |
+| [GUAC](https://guac.sh) | Graph for Understanding Artifact Composition; ingests SLSA provenance, SBOMs, and OSV data to model supply chain relationships | Verification and policy |
+| [MLflow model registry](https://mlflow.org) | Experiment tracking and model versioning with lineage metadata; can emit provenance data | L1 provenance |
+| [DVC (Data Version Control)](https://dvc.org) | Git-based versioning for large datasets and model files with content-addressed storage | Dataset provenance |
+| [MLBOM / AI BOM](https://owasp.org/www-project-ai-security-and-privacy-guide/) | Machine Learning Bill of Materials — SBOM analogue for AI; captures datasets, base models, frameworks, and evaluation results | Complements SLSA provenance |
+
+---
+
+### AI as a Builder: Risks of AI-Generated Code
+
+The preceding discussion treats AI models as *artifacts to be protected*. There is a second, increasingly important dimension: AI as an active participant in the software build process itself — specifically, AI coding assistants and autonomous agents that write, modify, and commit source code.
+
+When a developer uses GitHub Copilot, Cursor, or Claude to generate code that is committed to a repository and built into a release artifact, a question arises: **does SLSA provenance capture the AI's participation in authoring the source?**
+
+Under current SLSA v1.0, provenance captures the transformation of committed source code into an artifact. It does not capture how that source code came to be. The commit SHA in the provenance attests that the artifact was built from a specific commit — it does not attest to the authorship of that commit's content.
+
+**This creates a provenance gap for AI-generated code:**
+
+- A SLSA L3 artifact can have fully verified, non-falsifiable build provenance while being built from source code that was entirely generated by an AI system, with no human review
+- The supply chain integrity of the build process is fully assured; the integrity of the *authorship* process is not captured at all
+- An autonomous AI agent that commits malicious code to a repository — whether due to a prompt injection attack, a compromised model, or deliberate misuse — produces a SLSA-attested artifact with valid provenance
+
+**Risk scenarios specific to AI-assisted development:**
+
+| Scenario | SLSA Detection | Notes |
+|----------|---------------|-------|
+| Developer uses AI to write code; reviews and commits it | ✗ Not detected — normal commit | Acceptable; human review is the control |
+| AI agent autonomously commits code without human review | ✗ Not detected by SLSA | Control must be at source track level (branch protection, required reviews) |
+| Prompt injection causes AI agent to commit a backdoor | ✗ Not detected by SLSA | SLSA attests the build, not the commit's semantic content |
+| AI generates a malicious dependency in `package.json` | ✗ Not detected at L1/L2 | Dependency provenance verification (SLSA for deps) can surface this |
+| AI coding assistant suggests a supply chain attack payload | ✗ Not detected | Out of scope for SLSA entirely |
+
+**Mitigations at the source track level** (complements SLSA build track):
+
+SLSA's **source track** (currently in draft) begins to address this gap. It introduces requirements for source integrity — including two-person review requirements and version control platform controls — that would apply to AI-authored commits. Until the source track matures, the primary controls are:
+
+1. **Branch protection rules** — require human review and approval of all commits before merge, regardless of authorship
+2. **Commit signing** — require GPG or SSH-signed commits; an AI agent acting autonomously cannot produce a valid human signature
+3. **AI authorship disclosure** — emerging tools (e.g., GitHub's AI code attribution) can annotate commits as AI-assisted; this is auditable but not yet cryptographically enforced
+4. **Agent permission scoping** — restrict autonomous coding agents to read-only repository access; require human approval before any commit is accepted
+
+```yaml
+# .github/branch_protection.yml (conceptual — configure via API or UI)
+# Enforce human review even when AI agents participate in PRs
+required_pull_request_reviews:
+  required_approving_review_count: 1
+  dismiss_stale_reviews: true
+  require_code_owner_reviews: true
+  # Note: GitHub Copilot-generated PR suggestions still require human approval
+restrict_pushes:
+  allow_actors: []   # No direct push to main — all changes via reviewed PR
+```
+
+**The forward trajectory:** As AI agents become first-class participants in software development — writing code, running tests, opening PRs, and merging changes — the distinction between "source authored by a human" and "source generated by an AI" will require explicit provenance representation. The SLSA community and OpenSSF AI/ML Working Group are actively developing extensions to address this. The most likely near-term approach is extending the `externalParameters` field to include AI tool identity and version, and adding optional `aiAssistance` metadata to provenance predicates.
+
+---
+
+## 12. References
+
+**SLSA Core**
 
 - [SLSA Specification v1.0](https://slsa.dev/spec/v1.0) — Official framework specification
 - [slsa.dev](https://slsa.dev) — SLSA home page, getting started guides
@@ -659,6 +1000,19 @@ Provenance should be verified at **consumption time** — when your CI pipeline 
 - [PyPI Trusted Publishers](https://docs.pypi.org/trusted-publishers/) — PyPI provenance documentation
 - [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) — GitHub native attestation documentation
 
+**AI Supply Chain Security**
+
+- [OpenSSF Model Signing (OMS) Specification](https://openssf.org/blog/2025/06/25/an-introduction-to-the-openssf-model-signing-oms-specification/) — Sigstore-compatible signing standard for ML model artifacts
+- [sigstore/model-transparency](https://github.com/sigstore/model-transparency) — Reference implementation of AI model signing and provenance
+- [Google: Securing the AI Software Supply Chain](https://research.google/pubs/securing-the-ai-software-supply-chain/) — Google's approach to adapting SLSA for AI pipelines
+- [Google Cloud: AI Supply Chain Security Guidance](https://cloud.google.com/transform/same-same-but-also-different-google-guidance-ai-supply-chain-security/) — Practical guidance on AI provenance and SLSA adaptation
+- [GUAC — Graph for Understanding Artifact Composition](https://guac.sh) — Supply chain knowledge graph ingesting SLSA, SBOM, and OSV data
+- [NVIDIA Hopper Confidential Computing](https://www.nvidia.com/en-us/data-center/solutions/confidential-computing/) — GPU hardware attestation for training workloads
+- [DVC — Data Version Control](https://dvc.org) — Dataset and model versioning with content-addressed storage
+- [Hugging Face Model Cards](https://huggingface.co/docs/hub/model-cards) — Structured metadata specification for AI models
+- [OWASP AI Security and Privacy Guide](https://owasp.org/www-project-ai-security-and-privacy-guide/) — AI BOM and threat modelling for AI systems
+- [OpenSSF AI/ML Working Group](https://github.com/ossf/ai-ml-security) — Standards development for AI supply chain security
+
 ---
 
-*Specification reference: SLSA v1.0 · Last reviewed: 2024 · Maintained at [github.com/cjohannsen81/slsa-guide](https://github.com/cjohannsen81/slsa-guide)*
+*Specification reference: SLSA v1.0 · Last reviewed: 2025 · Maintained at [github.com/cjohannsen81/slsa-guide](https://github.com/cjohannsen81/slsa-guide)*

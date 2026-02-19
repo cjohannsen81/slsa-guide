@@ -1,0 +1,5 @@
+title: "Ultimate Guide to SLSA"
+description: "Supply-chain Levels for Software Artifacts — a comprehensive technical reference."
+theme: jekyll-theme-midnight
+url: "https://cjohannsen81.github.io"
+baseurl: "/slsa-guide"

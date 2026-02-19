@@ -1,7 +1,7 @@
 # Ultimate Guide to SLSA
 ### Supply-chain Levels for Software Artifacts
 
-> A technical reference for understanding, implementing, and verifying SLSA across packages, containers, and binary artifacts.
+A technical reference for understanding, implementing, and verifying SLSA across packages, containers, and binary artifacts.
 
 ---
 
